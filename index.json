@@ -5,7 +5,7 @@
     {
       "id": "animeav1",
       "name": "AnimeAV1",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "type": "anime",
       "lang": "es",
       "file": "providers/animeav1.js",
