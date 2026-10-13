@@ -1,16 +1,18 @@
 // providers/animeav1.js — AnimeAV1 source for Zangetsu (animeav1.com)
-// v1.0.4 — usa __data.json de SvelteKit (mucho más ligero que el HTML).
+// v1.0.5 — usa la API no oficial (animeav1.ahmedrangel.com) para detail y streams.
+// Search y home siguen con scraping normal.
 
 var SOURCE_ID = (typeof __SOURCE_ID !== 'undefined' && __SOURCE_ID)
   ? String(__SOURCE_ID) : 'animeav1';
 
 var SITE = 'https://animeav1.com';
+var API  = 'https://animeav1.ahmedrangel.com';
 var UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
   + '(KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 function getInfo() {
   return { name: 'AnimeAV1', lang: 'es', baseUrl: SITE,
-    logo: SITE + '/favicon.ico', type: 'anime', version: '1.0.4' };
+    logo: SITE + '/favicon.ico', type: 'anime', version: '1.0.5' };
 }
 
 function _mode(opts) { return (opts && opts.category === 'dub') ? 'dub' : 'sub'; }
@@ -32,7 +34,6 @@ function _text(s) {
     .replace(/^\s+|\s+$/g, '');
 }
 
-// ── Cards (mismo parser que antes) ─────────────────────────────────────────
 function _cards(seg) {
   var out = [], seen = {};
   var chunks = String(seg || '').split(/<article\b[\s>]/i);
@@ -56,6 +57,7 @@ function _cards(seg) {
   return out;
 }
 
+// ── Search y Home: scraping normal sobre HTML ─────────────────────────────
 function search(query, page, opts) {
   var q = String(query || '').trim();
   if (q.length < 1) return Promise.resolve([]);
@@ -74,55 +76,9 @@ function getHome(opts) {
   }).catch(function () { return []; });
 }
 
+// ── Detail: API JSON ──────────────────────────────────────────────────────
 function _epUrl(cat, slug, num) {
   return 'animeav1://' + cat + '/' + slug + '/' + num;
-}
-
-// ── Parser del formato "devalue" de SvelteKit ─────────────────────────────
-// __data.json devuelve un array "nodes". Cada nodo tiene un array "data"
-// donde los valores pueden ser índices a posiciones del propio array.
-// Hay que resolver esas referencias recursivamente.
-function _devalueResolve(data, idx, seen) {
-  if (idx == null) return idx;
-  if (typeof idx !== 'number') return idx;
-  if (seen && seen[idx]) return null;
-  var val = data[idx];
-  if (val == null) return val;
-  if (typeof val !== 'object') return val;
-  var s = seen ? seen.slice() : [];
-  s[idx] = true;
-  if (Array.isArray(val)) {
-    var arr = [];
-    for (var i = 0; i < val.length; i++) {
-      arr.push(_devalueResolve(data, val[i], s));
-    }
-    return arr;
-  }
-  var obj = {};
-  for (var k in val) {
-    if (!Object.prototype.hasOwnProperty.call(val, k)) continue;
-    obj[k] = _devalueResolve(data, val[k], s);
-  }
-  return obj;
-}
-
-// Encuentra el objeto media dentro de todos los nodos del __data.json.
-function _extractMedia(json) {
-  if (!json || !json.nodes) return null;
-  for (var n = 0; n < json.nodes.length; n++) {
-    var node = json.nodes[n];
-    if (!node || !node.data) continue;
-    var data = node.data;
-    for (var i = 0; i < data.length; i++) {
-      var v = data[i];
-      if (v && typeof v === 'object' && !Array.isArray(v) && v.media != null) {
-        // v.media es un índice → resolverlo
-        var media = _devalueResolve(data, v.media, [i]);
-        if (media && media.title) return media;
-      }
-    }
-  }
-  return null;
 }
 
 var _detailCache = {};
@@ -143,39 +99,32 @@ function getDetail(url, opts) {
 function _fetchDetail(url, opts) {
   var slug = String(url).replace(/^\/+/, '').replace(/\/.*$/, '');
   var cat = _mode(opts);
-  var dataUrl = SITE + '/media/' + encodeURIComponent(slug) + '/__data.json';
+  var apiUrl = API + '/api/anime/' + encodeURIComponent(slug);
 
-  return _get(dataUrl, SITE + '/media/' + slug).then(function (body) {
-    var json = null;
-    try { json = JSON.parse(body); } catch (e) { json = null; }
-    if (!json) {
-      // Fallback: si el __data.json falla, no devolvemos nada útil.
-      return { id: slug, title: slug, url: slug, episodes: [],
-        cover: null, description: 'AnimeAV1: __data.json inválido',
-        type: 'anime', sourceId: SOURCE_ID, subCount: 0, dubCount: 0 };
+  return _get(apiUrl, SITE + '/media/' + slug).then(function (body) {
+    var j = null;
+    try { j = JSON.parse(body); } catch (e) { j = null; }
+    if (!j || !j.success || !j.data) {
+      return {
+        id: slug, title: slug, url: slug, episodes: [],
+        cover: null, description: 'AnimeAV1: API no devolvió datos válidos',
+        type: 'anime', sourceId: SOURCE_ID, subCount: 0, dubCount: 0
+      };
     }
+    var d = j.data;
 
-    var media = _extractMedia(json);
-    if (!media) {
-      return { id: slug, title: slug, url: slug, episodes: [],
-        cover: null, description: 'AnimeAV1: media no encontrado',
-        type: 'anime', sourceId: SOURCE_ID, subCount: 0, dubCount: 0 };
-    }
+    var title = d.title || slug;
+    var synopsis = d.synopsis || '';
+    var cover = d.cover || null;
+    var year = typeof d.year === 'number' ? d.year : null;
+    var malId = typeof d.malId === 'number' ? d.malId : null;
+    var typeName = String(d.type || '');
+    var isMovie = /pel[ií]cula|especial|movie/i.test(typeName);
 
-    // El objeto media ya viene resuelto con propiedades reales.
-    var title = media.title || slug;
-    var synopsis = media.synopsis || '';
-    var cover = media.poster || null;
-    var year = media.startDate ? parseInt(String(media.startDate).slice(0, 4), 10) : null;
-    var malId = typeof media.malId === 'number' ? media.malId : null;
-    var catName = (media.category && media.category.name) || '';
-    var isMovie = /pel[ií]cula|especial|movie/i.test(catName);
-
-    // Episodios
     var eps = [];
-    if (media.episodes && media.episodes.length) {
-      for (var i = 0; i < media.episodes.length; i++) {
-        var ep = media.episodes[i];
+    if (d.episodes && d.episodes.length) {
+      for (var i = 0; i < d.episodes.length; i++) {
+        var ep = d.episodes[i];
         if (!ep || typeof ep.number !== 'number') continue;
         eps.push({
           id: cat + ':' + ep.number,
@@ -184,29 +133,19 @@ function _fetchDetail(url, opts) {
           url: _epUrl(cat, slug, ep.number)
         });
       }
-    } else if (typeof media.episodesCount === 'number' && media.episodesCount > 0) {
-      for (var j = 1; j <= media.episodesCount; j++) {
-        eps.push({
-          id: cat + ':' + j, number: j,
-          title: 'Episodio ' + j, url: _epUrl(cat, slug, j)
-        });
-      }
     }
-
     if (eps.length === 1) eps[0].title = title;
 
     return {
       id: slug, title: title, englishTitle: title, url: slug,
       cover: cover, banner: null, description: synopsis,
-      status: 'unknown', genres: [], studios: [],
+      status: 'unknown',
+      genres: Array.isArray(d.genres) ? d.genres : [],
+      studios: [],
       type: isMovie ? 'movie' : 'anime',
       sourceId: SOURCE_ID, episodes: eps,
       year: year, malId: malId, subCount: 0, dubCount: 0
     };
-  }).catch(function () {
-    return { id: slug, title: slug, url: slug, episodes: [],
-      cover: null, description: 'AnimeAV1: error de fetch',
-      type: 'anime', sourceId: SOURCE_ID, subCount: 0, dubCount: 0 };
   });
 }
 
@@ -214,10 +153,7 @@ function getEpisodes(url, opts) {
   return getDetail(url, opts).then(function (d) { return d.episodes; });
 }
 
-// ── Streams ────────────────────────────────────────────────────────────────
-// Los mirrors siguen en el HTML de /media/<slug>/<num>. La página del
-// episodio pesa poco (no incluye la lista de 1180 episodios), así que el
-// fetch normal debería bastar. Aun así usamos el mismo parser de siempre.
+// ── Streams: API JSON para el episodio ────────────────────────────────────
 function getVideoSources(episodeUrl) {
   var parts = String(episodeUrl).replace('animeav1://', '').split('/');
   var cat = (parts[0] === 'dub') ? 'dub' : 'sub';
@@ -225,58 +161,51 @@ function getVideoSources(episodeUrl) {
   var num = parts[2] || '1';
   if (!slug) return Promise.reject(new Error('AnimeAV1: no slug'));
 
-  var url = SITE + '/media/' + slug + '/' + num;
-  return _get(url, SITE + '/').then(function (html) {
-    var embedsIdx = html.indexOf('embeds:{');
-    if (embedsIdx < 0) throw new Error('AnimeAV1: no embeds');
-
-    var obStart = html.indexOf('{', embedsIdx);
-    var depth = 0, i = obStart, inStr = false, quote = '', esc = false;
-    for (; i < html.length; i++) {
-      var ch = html[i];
-      if (inStr) {
-        if (esc) { esc = false; continue; }
-        if (ch === '\\') { esc = true; continue; }
-        if (ch === quote) inStr = false;
-        continue;
+  var apiUrl = API + '/api/anime/' + encodeURIComponent(slug) + '/' + encodeURIComponent(num);
+  return _get(apiUrl, SITE + '/media/' + slug + '/' + num).then(function (body) {
+    var j = null;
+    try { j = JSON.parse(body); } catch (e) { j = null; }
+    if (!j || !j.success || !j.data) {
+      throw new Error('AnimeAV1: API de episodio sin datos');
+    }
+    var embeds = j.data.embeds || [];
+    // Filtramos por tipo de audio (SUB / DUB). Algunas respuestas traen "type"
+    // con el idioma o la categoría. Nos quedamos con los que apliquen.
+    var wanted = [];
+    for (var i = 0; i < embeds.length; i++) {
+      var e = embeds[i];
+      if (!e || !e.url) continue;
+      var t = String(e.type || '').toLowerCase();
+      // Si el type coincide con nuestro cat, o si no hay type específico,
+      // lo aceptamos (muchos vuelven vacío).
+      if (t === '' || t === cat || t === 'sub' || t === 'dub' ||
+          (cat === 'dub' && t === 'latino') || (cat === 'sub' && t === 'sub')) {
+        wanted.push(e);
       }
-      if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue; }
-      if (ch === '{') depth++;
-      else if (ch === '}') { depth--; if (depth === 0) break; }
     }
-    var embedsObj = html.slice(obStart, i + 1);
+    // Si el filtrado dejó fuera todo, usamos todos y que el player pruebe.
+    if (!wanted.length) wanted = embeds.filter(function (e) { return e && e.url; });
 
-    var key = cat.toUpperCase();
-    var keyIdx = embedsObj.indexOf(key + ':[');
-    if (keyIdx < 0) throw new Error('AnimeAV1: no ' + cat + ' embeds');
-    var arrStart = embedsObj.indexOf('[', keyIdx);
-    var arrEnd = embedsObj.indexOf(']', arrStart);
-    var arr = embedsObj.slice(arrStart, arrEnd + 1);
+    if (!wanted.length) throw new Error('AnimeAV1: sin servidores');
 
-    var servers = [];
-    var re = /\{server:"([^"]+)",url:"([^"]+)"\}/g, m;
-    while ((m = re.exec(arr)) !== null) {
-      servers.push({ name: m[1], url: m[2] });
-    }
-    if (!servers.length) throw new Error('AnimeAV1: no servers');
-
-    return _tryServers(servers, 0, cat, url);
+    return _tryEmbeds(wanted, 0, cat);
   });
 }
 
-function _tryServers(list, i, cat, ref) {
+function _tryEmbeds(list, i, cat) {
   if (i >= list.length) {
-    return Promise.reject(new Error('AnimeAV1: no playable server'));
+    return Promise.reject(new Error('AnimeAV1: ningún servidor reproducible'));
   }
-  return _extractStream(list[i].url, cat, ref).catch(function () {
-    return _tryServers(list, i + 1, cat, ref);
+  return _extractStream(list[i].url, cat).catch(function () {
+    return _tryEmbeds(list, i + 1, cat);
   });
 }
 
-function _extractStream(embed, cat, ref) {
+function _extractStream(embed, cat) {
   var base = (embed.match(/^https?:\/\/[^/]+/) || [])[0] || SITE;
-  return _get(embed, ref || SITE + '/').then(function (html) {
+  return _get(embed, SITE + '/').then(function (html) {
     var file = null;
+
     var m1 = html.match(/(https?:\/\/[^"'\s\\]+\.m3u8[^"'\s\\]*)/);
     if (m1) file = m1[1];
     if (!file) {
@@ -295,15 +224,14 @@ function _extractStream(embed, cat, ref) {
         if (m5b) file = m5b[1];
       }
     }
-    if (!file) throw new Error('AnimeAV1: no stream');
+    if (!file) throw new Error('AnimeAV1: sin stream');
 
     return [{
       url: file, quality: 'auto',
       container: /\.m3u8(\?|$)/i.test(file) ? 'hls' : 'mp4',
-      headers: {
-        'User-Agent': UA, 'Referer': base + '/', 'Origin': base
-      },
-      kind: cat, audioLang: cat === 'dub' ? 'es' : 'ja',
+      headers: { 'User-Agent': UA, 'Referer': base + '/', 'Origin': base },
+      kind: cat,
+      audioLang: cat === 'dub' ? 'es' : 'ja',
       subtitles: []
     }];
   });
