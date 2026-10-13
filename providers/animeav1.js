@@ -1,14 +1,5 @@
 // providers/animeav1.js — AnimeAV1 source for Zangetsu (animeav1.com)
-//
-// Endpoints:
-//   /catalogo?search=&category=&genre=&page=  -> grilla de cards
-//   /media/<slug>                             -> detalle + metadata + episodesCount
-//   /media/<slug>/<num>                       -> página del episodio (embeds SUB/DUB)
-//
-// La metadata y la lista de episodios viven dentro del HTML, en el <script>
-// final con `kit.start(app, element, {...})`. Los embeds solo están en la
-// página del episodio, en la propiedad `embeds:{SUB:[...],DUB:[...]}` del mismo
-// script.
+// v1.0.2 — parseo directo sobre el HTML (sin extraer el <script>)
 
 var SOURCE_ID = (typeof __SOURCE_ID !== 'undefined' && __SOURCE_ID)
   ? String(__SOURCE_ID) : 'animeav1';
@@ -20,7 +11,7 @@ var UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 
 function getInfo() {
   return { name: 'AnimeAV1', lang: 'es', baseUrl: SITE,
-    logo: SITE + '/favicon.ico', type: 'anime', version: '1.0.1' };
+    logo: SITE + '/favicon.ico', type: 'anime', version: '1.0.2' };
 }
 
 function _mode(opts) { return (opts && opts.category === 'dub') ? 'dub' : 'sub'; }
@@ -42,14 +33,6 @@ function _text(s) {
     .replace(/^\s+|\s+$/g, '');
 }
 
-// ── Cards ──────────────────────────────────────────────────────────────────
-// Estructura por card:
-//   <article>
-//     <a href="/media/<slug>">
-//       <figure><img src="..."></figure>
-//       <header><h3>Título</h3></header>
-//     </a>
-//   </article>
 function _cards(seg) {
   var out = [], seen = {};
   var chunks = String(seg || '').split(/<article\b[\s>]/i);
@@ -78,7 +61,6 @@ function _cards(seg) {
   return out;
 }
 
-// ── Search ─────────────────────────────────────────────────────────────────
 function search(query, page, opts) {
   var q = String(query || '').trim();
   if (q.length < 1) return Promise.resolve([]);
@@ -89,76 +71,12 @@ function search(query, page, opts) {
   return _get(url, SITE + '/').then(_cards).catch(function () { return []; });
 }
 
-// ── Home ───────────────────────────────────────────────────────────────────
 function getHome(opts) {
   return _get(SITE + '/catalogo?status=emision', SITE + '/').then(function (html) {
     var items = _cards(html);
     if (!items.length) return [];
     return [{ title: 'En emisión', items: items }];
   }).catch(function () { return []; });
-}
-
-// ── Helpers de parsing del script de SvelteKit ─────────────────────────────
-// Busca el primer <script> que contenga "kit.start(app, element" y devuelve
-// su contenido. Sin lazy problemático: hacemos split por <script ...> y
-// buscamos el que tenga kit.start dentro.
-function _kitScript(html) {
-  var h = String(html || '');
-  var re = /<script\b[^>]*>([\s\S]*?)<\/script>/gi, m;
-  while ((m = re.exec(h)) !== null) {
-    if (m[1].indexOf('kit.start(app, element') > -1) return m[1];
-  }
-  return '';
-}
-
-// Extrae el objeto `media:{...}` del script del kit. Es un objeto JS, no
-// JSON, así que lo tratamos con regex sobre el texto.
-function _extractMediaObj(script) {
-  var i = script.indexOf('media:{');
-  if (i < 0) return '';
-  // Buscamos el cierre del objeto contando llaves desde ese punto.
-  var start = i + 'media:'.length; // posición de la "{"
-  var depth = 0, inStr = false, quote = '', esc = false;
-  for (var j = start; j < script.length; j++) {
-    var ch = script[j];
-    if (inStr) {
-      if (esc) { esc = false; continue; }
-      if (ch === '\\') { esc = true; continue; }
-      if (ch === quote) { inStr = false; }
-      continue;
-    }
-    if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue; }
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return script.slice(start, j + 1);
-    }
-  }
-  return '';
-}
-
-// Extrae el objeto `embeds:{SUB:[...],DUB:[...]}` del script del kit.
-function _extractEmbedsObj(script) {
-  var i = script.indexOf('embeds:{');
-  if (i < 0) return '';
-  var start = i + 'embeds:'.length;
-  var depth = 0, inStr = false, quote = '', esc = false;
-  for (var j = start; j < script.length; j++) {
-    var ch = script[j];
-    if (inStr) {
-      if (esc) { esc = false; continue; }
-      if (ch === '\\') { esc = true; continue; }
-      if (ch === quote) { inStr = false; }
-      continue;
-    }
-    if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue; }
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return script.slice(start, j + 1);
-    }
-  }
-  return '';
 }
 
 function _epUrl(cat, slug, num) {
@@ -180,67 +98,64 @@ function getDetail(url, opts) {
   });
 }
 
+// ── Parseo directo sobre el HTML (sin extraer <script>) ────────────────────
 function _fetchDetail(url, opts) {
   var slug = String(url).replace(/^\/+/, '').replace(/\/.*$/, '');
   var cat = _mode(opts);
   return _get(SITE + '/media/' + encodeURIComponent(slug), SITE + '/')
     .then(function (html) {
-      var script = _kitScript(html);
-      var mediaObj = script ? _extractMediaObj(script) : '';
-
-      // Título
-      var title = (mediaObj.match(/title:"((?:[^"\\]|\\.)*)"/) || [])[1]
+      // Título: buscamos `title:"..."` que aparece en el objeto media
+      var title = (html.match(/title:"((?:[^"\\]|\\.)*)",aka/) || [])[1]
+               || (html.match(/title:"((?:[^"\\]|\\.)*)"/) || [])[1]
                || _text((html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/) || [])[1])
                || slug;
-      title = title.replace(/\\"/g, '"').replace(/\\n/g, ' ');
+      title = title.replace(/\\"/g, '"').replace(/\\n/g, ' ').trim();
 
-      // Sinopsis
-      var synopsis = (mediaObj.match(/synopsis:"((?:[^"\\]|\\.)*)"/) || [])[1] || '';
+      var synopsis = (html.match(/synopsis:"((?:[^"\\]|\\.)*)"/) || [])[1] || '';
       synopsis = synopsis.replace(/\\"/g, '"').replace(/\\n/g, '\n');
 
-      // Cover
-      var cover = (mediaObj.match(/poster:"([^"]+)"/) || [])[1]
-               || (html.match(/<figure[^>]*>[\s\S]{0,500}?<img[^>]+src="([^"]+)"/) || [])[1]
+      var cover = (html.match(/poster:"([^"]+)"/) || [])[1]
                || (html.match(/property="og:image"[^>]*content="([^"]+)"/) || [])[1]
                || null;
 
-      // ID interno (para banner/backdrop)
-      var mid = (mediaObj.match(/\bid:(\d+),categoryId/) || [])[1];
-      var banner = mid ? (CDN + '/thumbnails/' + mid + '.jpg') : null;
-
-      // Año
-      var yearM = mediaObj.match(/startDate:"(\d{4})/);
+      var yearM = html.match(/startDate:"(\d{4})/);
       var year = yearM ? parseInt(yearM[1], 10) : null;
 
-      // Tipo (category.name)
-      var catM = mediaObj.match(/category:\{id:\d+,name:"([^"]+)"/);
+      var catM = html.match(/category:\{id:\d+,name:"([^"]+)"/);
       var catName = catM ? catM[1] : '';
       var isMovie = /pel[ií]cula|especial|movie/i.test(catName);
 
-      // MAL id
-      var malM = mediaObj.match(/malId:(\d+)/);
+      var malM = html.match(/malId:(\d+)/);
       var malId = malM ? parseInt(malM[1], 10) : null;
 
-      // ── Episodios ──────────────────────────────────────────────────────
-      // Los sacamos directamente del array `episodes:[{id:N,number:M},...]`
-      // que está dentro de mediaObj. Fallback a `episodesCount:N`.
+      // ── Episodios ─────────────────────────────────────────────────────
+      // El array en el HTML es:  episodes:[{id:3433,number:1},{id:3434,number:2},...]
       var eps = [];
-      var epArrM = mediaObj.match(/episodes:\[([\s\S]*?)\](?:,|\})/);
-      if (epArrM) {
-        var re = /\{id:(\d+),number:(\d+)\}/g, m;
-        while ((m = re.exec(epArrM[1])) !== null) {
-          var num = parseInt(m[2], 10);
-          eps.push({
-            id: cat + ':' + num,
-            number: num,
-            title: 'Episodio ' + num,
-            url: _epUrl(cat, slug, num)
-          });
+      // Buscamos desde el primer "{id:" hasta el cierre del array
+      var startIdx = html.search(/episodes:\[\{id:\d+,number:\d+\}/);
+      if (startIdx > -1) {
+        // Delimitamos: desde "episodes:[" buscamos el "]" que cierra el array
+        var arrStart = html.indexOf('[', startIdx);
+        var arrEnd = html.indexOf(']', arrStart);
+        if (arrStart > -1 && arrEnd > arrStart) {
+          var arr = html.slice(arrStart, arrEnd + 1);
+          var re = /\{id:(\d+),number:(\d+)\}/g, m;
+          while ((m = re.exec(arr)) !== null) {
+            var num = parseInt(m[2], 10);
+            eps.push({
+              id: cat + ':' + num,
+              number: num,
+              title: 'Episodio ' + num,
+              url: _epUrl(cat, slug, num)
+            });
+          }
         }
       }
+
+      // Fallback: usar episodesCount:N
       if (!eps.length) {
-        var countM = (mediaObj.match(/episodesCount:(\d+)/) || [])[1];
-        var count = countM ? parseInt(countM, 10) : 0;
+        var countM = html.match(/episodesCount:(\d+)/);
+        var count = countM ? parseInt(countM[1], 10) : 0;
         for (var i = 1; i <= count; i++) {
           eps.push({
             id: cat + ':' + i,
@@ -251,22 +166,15 @@ function _fetchDetail(url, opts) {
         }
       }
 
-      // Si solo hay 1 episodio, es probablemente una película → no numerar.
       if (eps.length === 1) eps[0].title = title;
 
       return {
         id: slug, title: title, englishTitle: title, url: slug,
-        cover: cover,
-        banner: banner,
-        description: synopsis,
-        status: 'unknown',
-        genres: [],
-        studios: [],
+        cover: cover, banner: null, description: synopsis,
+        status: 'unknown', genres: [], studios: [],
         type: isMovie ? 'movie' : 'anime',
         sourceId: SOURCE_ID,
-        episodes: eps,
-        year: year,
-        malId: malId,
+        episodes: eps, year: year, malId: malId,
         subCount: 0, dubCount: 0
       };
     });
@@ -286,21 +194,40 @@ function getVideoSources(episodeUrl) {
 
   var url = SITE + '/media/' + slug + '/' + num;
   return _get(url, SITE + '/').then(function (html) {
-    var script = _kitScript(html);
-    if (!script) throw new Error('AnimeAV1: no kit script');
+    // Buscamos el bloque `embeds:{SUB:[...],DUB:[...]}` sobre todo el HTML.
+    // El array tiene la forma: [{server:"...",url:"..."}, ...]
+    var embedsIdx = html.indexOf('embeds:{');
+    if (embedsIdx < 0) throw new Error('AnimeAV1: no embeds');
 
-    var embedsObj = _extractEmbedsObj(script);
-    if (!embedsObj) throw new Error('AnimeAV1: no embeds');
+    var obStart = html.indexOf('{', embedsIdx);
+    // Vamos a contar llaves para encontrar el cierre del objeto embeds
+    var depth = 0, i = obStart, inStr = false, quote = '', esc = false;
+    for (; i < html.length; i++) {
+      var ch = html[i];
+      if (inStr) {
+        if (esc) { esc = false; continue; }
+        if (ch === '\\') { esc = true; continue; }
+        if (ch === quote) inStr = false;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue; }
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) break; }
+    }
+    var embedsObj = html.slice(obStart, i + 1);
 
-    // Extrae el array SUB:[...] o DUB:[...] de dentro de embedsObj.
-    var re = new RegExp(cat.toUpperCase() + ':\\[([\\s\\S]*?)\\]');
-    var arrM = embedsObj.match(re);
-    if (!arrM) throw new Error('AnimeAV1: no ' + cat + ' embeds');
+    // Extrae SUB:[...] o DUB:[...]
+    var key = cat.toUpperCase();
+    var keyIdx = embedsObj.indexOf(key + ':[');
+    if (keyIdx < 0) throw new Error('AnimeAV1: no ' + cat + ' embeds');
 
-    // Cada mirror es {server:"...",url:"..."}
+    var arrStart = embedsObj.indexOf('[', keyIdx);
+    var arrEnd = embedsObj.indexOf(']', arrStart);
+    var arr = embedsObj.slice(arrStart, arrEnd + 1);
+
     var servers = [];
-    var re2 = /\{server:"([^"]+)",url:"([^"]+)"\}/g, m;
-    while ((m = re2.exec(arrM[1])) !== null) {
+    var re = /\{server:"([^"]+)",url:"([^"]+)"\}/g, m;
+    while ((m = re.exec(arr)) !== null) {
       servers.push({ name: m[1], url: m[2] });
     }
     if (!servers.length) throw new Error('AnimeAV1: no servers');
@@ -318,29 +245,22 @@ function _tryServers(list, i, cat, ref) {
   });
 }
 
-// El servidor "HLS" de AnimeAV1 (player.zilla-networks.com) es el más fiable:
-// devuelve un m3u8 directo dentro del HTML. Los otros (UPNShare, Voe, Byse,
-// MP4Upload) requieren POST/decrypt y se intentan como fallback.
 function _extractStream(embed, cat, ref) {
   var base = (embed.match(/^https?:\/\/[^/]+/) || [])[0] || SITE;
   return _get(embed, ref || SITE + '/').then(function (html) {
     var file = null;
 
-    // 1) m3u8 directo
     var m1 = html.match(/(https?:\/\/[^"'\s\\]+\.m3u8[^"'\s\\]*)/);
     if (m1) file = m1[1];
 
-    // 2) file: "..." (JW/Clappr)
     if (!file) {
       var m2 = html.match(/file\s*:\s*["']([^"']+\.m3u8[^"']*)["']/i);
       if (m2) file = m2[1];
     }
-    // 3) sources: [{file:"..."}]
     if (!file) {
       var m3 = html.match(/sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["']([^"']+)["']/i);
       if (m3) file = m3[1];
     }
-    // 4) base64 dentro de atob(...)
     if (!file) {
       var m5 = html.match(/atob\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)/);
       if (m5) {
