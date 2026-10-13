@@ -9,7 +9,6 @@
       "type": "anime",
       "lang": "es",
       "file": "providers/animeav1.js",
-      "logo": "icons/animeav1.png",
       "nsfw": false
     }
   ]
