@@ -1,0 +1,16 @@
+{
+  "name": "Mis Providers",
+  "description": "Providers personalizados para Zangetsu.",
+  "sources": [
+    {
+      "id": "animeav1",
+      "name": "AnimeAV1",
+      "version": "1.0.0",
+      "type": "anime",
+      "lang": "es",
+      "file": "providers/animeav1.js",
+      "logo": "icons/animeav1.png",
+      "nsfw": false
+    }
+  ]
+}
