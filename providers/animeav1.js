@@ -1,17 +1,16 @@
 // providers/animeav1.js — AnimeAV1 source for Zangetsu (animeav1.com)
-// v1.0.2 — parseo directo sobre el HTML (sin extraer el <script>)
+// v1.0.4 — usa __data.json de SvelteKit (mucho más ligero que el HTML).
 
 var SOURCE_ID = (typeof __SOURCE_ID !== 'undefined' && __SOURCE_ID)
   ? String(__SOURCE_ID) : 'animeav1';
 
 var SITE = 'https://animeav1.com';
-var CDN = 'https://cdn.animeav1.com';
 var UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
   + '(KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 function getInfo() {
   return { name: 'AnimeAV1', lang: 'es', baseUrl: SITE,
-    logo: SITE + '/favicon.ico', type: 'anime', version: '1.0.2' };
+    logo: SITE + '/favicon.ico', type: 'anime', version: '1.0.4' };
 }
 
 function _mode(opts) { return (opts && opts.category === 'dub') ? 'dub' : 'sub'; }
@@ -20,7 +19,7 @@ function _get(url, ref) {
   return fetch(url, {
     headers: {
       'User-Agent': UA,
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept': 'application/json, text/html, */*',
       'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
       'Referer': ref || SITE + '/'
     }
@@ -33,6 +32,7 @@ function _text(s) {
     .replace(/^\s+|\s+$/g, '');
 }
 
+// ── Cards (mismo parser que antes) ─────────────────────────────────────────
 function _cards(seg) {
   var out = [], seen = {};
   var chunks = String(seg || '').split(/<article\b[\s>]/i);
@@ -48,14 +48,9 @@ function _cards(seg) {
     if (!titleM) continue;
     seen[slug] = 1;
     out.push({
-      id: slug,
-      title: _text(titleM[1]),
-      englishTitle: _text(titleM[1]),
-      cover: imgM ? imgM[1] : null,
-      url: slug,
-      type: 'anime',
-      sourceId: SOURCE_ID,
-      subCount: 0, dubCount: 0
+      id: slug, title: _text(titleM[1]), englishTitle: _text(titleM[1]),
+      cover: imgM ? imgM[1] : null, url: slug,
+      type: 'anime', sourceId: SOURCE_ID, subCount: 0, dubCount: 0
     });
   }
   return out;
@@ -83,6 +78,53 @@ function _epUrl(cat, slug, num) {
   return 'animeav1://' + cat + '/' + slug + '/' + num;
 }
 
+// ── Parser del formato "devalue" de SvelteKit ─────────────────────────────
+// __data.json devuelve un array "nodes". Cada nodo tiene un array "data"
+// donde los valores pueden ser índices a posiciones del propio array.
+// Hay que resolver esas referencias recursivamente.
+function _devalueResolve(data, idx, seen) {
+  if (idx == null) return idx;
+  if (typeof idx !== 'number') return idx;
+  if (seen && seen[idx]) return null;
+  var val = data[idx];
+  if (val == null) return val;
+  if (typeof val !== 'object') return val;
+  var s = seen ? seen.slice() : [];
+  s[idx] = true;
+  if (Array.isArray(val)) {
+    var arr = [];
+    for (var i = 0; i < val.length; i++) {
+      arr.push(_devalueResolve(data, val[i], s));
+    }
+    return arr;
+  }
+  var obj = {};
+  for (var k in val) {
+    if (!Object.prototype.hasOwnProperty.call(val, k)) continue;
+    obj[k] = _devalueResolve(data, val[k], s);
+  }
+  return obj;
+}
+
+// Encuentra el objeto media dentro de todos los nodos del __data.json.
+function _extractMedia(json) {
+  if (!json || !json.nodes) return null;
+  for (var n = 0; n < json.nodes.length; n++) {
+    var node = json.nodes[n];
+    if (!node || !node.data) continue;
+    var data = node.data;
+    for (var i = 0; i < data.length; i++) {
+      var v = data[i];
+      if (v && typeof v === 'object' && !Array.isArray(v) && v.media != null) {
+        // v.media es un índice → resolverlo
+        var media = _devalueResolve(data, v.media, [i]);
+        if (media && media.title) return media;
+      }
+    }
+  }
+  return null;
+}
+
 var _detailCache = {};
 var _DETAIL_TTL = 300000;
 
@@ -98,86 +140,74 @@ function getDetail(url, opts) {
   });
 }
 
-// ── Parseo directo sobre el HTML (sin extraer <script>) ────────────────────
 function _fetchDetail(url, opts) {
   var slug = String(url).replace(/^\/+/, '').replace(/\/.*$/, '');
   var cat = _mode(opts);
-  return _get(SITE + '/media/' + encodeURIComponent(slug), SITE + '/')
-    .then(function (html) {
-      // Título: buscamos `title:"..."` que aparece en el objeto media
-      var title = (html.match(/title:"((?:[^"\\]|\\.)*)",aka/) || [])[1]
-               || (html.match(/title:"((?:[^"\\]|\\.)*)"/) || [])[1]
-               || _text((html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/) || [])[1])
-               || slug;
-      title = title.replace(/\\"/g, '"').replace(/\\n/g, ' ').trim();
+  var dataUrl = SITE + '/media/' + encodeURIComponent(slug) + '/__data.json';
 
-      var synopsis = (html.match(/synopsis:"((?:[^"\\]|\\.)*)"/) || [])[1] || '';
-      synopsis = synopsis.replace(/\\"/g, '"').replace(/\\n/g, '\n');
+  return _get(dataUrl, SITE + '/media/' + slug).then(function (body) {
+    var json = null;
+    try { json = JSON.parse(body); } catch (e) { json = null; }
+    if (!json) {
+      // Fallback: si el __data.json falla, no devolvemos nada útil.
+      return { id: slug, title: slug, url: slug, episodes: [],
+        cover: null, description: 'AnimeAV1: __data.json inválido',
+        type: 'anime', sourceId: SOURCE_ID, subCount: 0, dubCount: 0 };
+    }
 
-      var cover = (html.match(/poster:"([^"]+)"/) || [])[1]
-               || (html.match(/property="og:image"[^>]*content="([^"]+)"/) || [])[1]
-               || null;
+    var media = _extractMedia(json);
+    if (!media) {
+      return { id: slug, title: slug, url: slug, episodes: [],
+        cover: null, description: 'AnimeAV1: media no encontrado',
+        type: 'anime', sourceId: SOURCE_ID, subCount: 0, dubCount: 0 };
+    }
 
-      var yearM = html.match(/startDate:"(\d{4})/);
-      var year = yearM ? parseInt(yearM[1], 10) : null;
+    // El objeto media ya viene resuelto con propiedades reales.
+    var title = media.title || slug;
+    var synopsis = media.synopsis || '';
+    var cover = media.poster || null;
+    var year = media.startDate ? parseInt(String(media.startDate).slice(0, 4), 10) : null;
+    var malId = typeof media.malId === 'number' ? media.malId : null;
+    var catName = (media.category && media.category.name) || '';
+    var isMovie = /pel[ií]cula|especial|movie/i.test(catName);
 
-      var catM = html.match(/category:\{id:\d+,name:"([^"]+)"/);
-      var catName = catM ? catM[1] : '';
-      var isMovie = /pel[ií]cula|especial|movie/i.test(catName);
-
-      var malM = html.match(/malId:(\d+)/);
-      var malId = malM ? parseInt(malM[1], 10) : null;
-
-      // ── Episodios ─────────────────────────────────────────────────────
-      // El array en el HTML es:  episodes:[{id:3433,number:1},{id:3434,number:2},...]
-      var eps = [];
-      // Buscamos desde el primer "{id:" hasta el cierre del array
-      var startIdx = html.search(/episodes:\[\{id:\d+,number:\d+\}/);
-      if (startIdx > -1) {
-        // Delimitamos: desde "episodes:[" buscamos el "]" que cierra el array
-        var arrStart = html.indexOf('[', startIdx);
-        var arrEnd = html.indexOf(']', arrStart);
-        if (arrStart > -1 && arrEnd > arrStart) {
-          var arr = html.slice(arrStart, arrEnd + 1);
-          var re = /\{id:(\d+),number:(\d+)\}/g, m;
-          while ((m = re.exec(arr)) !== null) {
-            var num = parseInt(m[2], 10);
-            eps.push({
-              id: cat + ':' + num,
-              number: num,
-              title: 'Episodio ' + num,
-              url: _epUrl(cat, slug, num)
-            });
-          }
-        }
+    // Episodios
+    var eps = [];
+    if (media.episodes && media.episodes.length) {
+      for (var i = 0; i < media.episodes.length; i++) {
+        var ep = media.episodes[i];
+        if (!ep || typeof ep.number !== 'number') continue;
+        eps.push({
+          id: cat + ':' + ep.number,
+          number: ep.number,
+          title: 'Episodio ' + ep.number,
+          url: _epUrl(cat, slug, ep.number)
+        });
       }
-
-      // Fallback: usar episodesCount:N
-      if (!eps.length) {
-        var countM = html.match(/episodesCount:(\d+)/);
-        var count = countM ? parseInt(countM[1], 10) : 0;
-        for (var i = 1; i <= count; i++) {
-          eps.push({
-            id: cat + ':' + i,
-            number: i,
-            title: 'Episodio ' + i,
-            url: _epUrl(cat, slug, i)
-          });
-        }
+    } else if (typeof media.episodesCount === 'number' && media.episodesCount > 0) {
+      for (var j = 1; j <= media.episodesCount; j++) {
+        eps.push({
+          id: cat + ':' + j, number: j,
+          title: 'Episodio ' + j, url: _epUrl(cat, slug, j)
+        });
       }
+    }
 
-      if (eps.length === 1) eps[0].title = title;
+    if (eps.length === 1) eps[0].title = title;
 
-      return {
-        id: slug, title: title, englishTitle: title, url: slug,
-        cover: cover, banner: null, description: synopsis,
-        status: 'unknown', genres: [], studios: [],
-        type: isMovie ? 'movie' : 'anime',
-        sourceId: SOURCE_ID,
-        episodes: eps, year: year, malId: malId,
-        subCount: 0, dubCount: 0
-      };
-    });
+    return {
+      id: slug, title: title, englishTitle: title, url: slug,
+      cover: cover, banner: null, description: synopsis,
+      status: 'unknown', genres: [], studios: [],
+      type: isMovie ? 'movie' : 'anime',
+      sourceId: SOURCE_ID, episodes: eps,
+      year: year, malId: malId, subCount: 0, dubCount: 0
+    };
+  }).catch(function () {
+    return { id: slug, title: slug, url: slug, episodes: [],
+      cover: null, description: 'AnimeAV1: error de fetch',
+      type: 'anime', sourceId: SOURCE_ID, subCount: 0, dubCount: 0 };
+  });
 }
 
 function getEpisodes(url, opts) {
@@ -185,6 +215,9 @@ function getEpisodes(url, opts) {
 }
 
 // ── Streams ────────────────────────────────────────────────────────────────
+// Los mirrors siguen en el HTML de /media/<slug>/<num>. La página del
+// episodio pesa poco (no incluye la lista de 1180 episodios), así que el
+// fetch normal debería bastar. Aun así usamos el mismo parser de siempre.
 function getVideoSources(episodeUrl) {
   var parts = String(episodeUrl).replace('animeav1://', '').split('/');
   var cat = (parts[0] === 'dub') ? 'dub' : 'sub';
@@ -194,13 +227,10 @@ function getVideoSources(episodeUrl) {
 
   var url = SITE + '/media/' + slug + '/' + num;
   return _get(url, SITE + '/').then(function (html) {
-    // Buscamos el bloque `embeds:{SUB:[...],DUB:[...]}` sobre todo el HTML.
-    // El array tiene la forma: [{server:"...",url:"..."}, ...]
     var embedsIdx = html.indexOf('embeds:{');
     if (embedsIdx < 0) throw new Error('AnimeAV1: no embeds');
 
     var obStart = html.indexOf('{', embedsIdx);
-    // Vamos a contar llaves para encontrar el cierre del objeto embeds
     var depth = 0, i = obStart, inStr = false, quote = '', esc = false;
     for (; i < html.length; i++) {
       var ch = html[i];
@@ -216,11 +246,9 @@ function getVideoSources(episodeUrl) {
     }
     var embedsObj = html.slice(obStart, i + 1);
 
-    // Extrae SUB:[...] o DUB:[...]
     var key = cat.toUpperCase();
     var keyIdx = embedsObj.indexOf(key + ':[');
     if (keyIdx < 0) throw new Error('AnimeAV1: no ' + cat + ' embeds');
-
     var arrStart = embedsObj.indexOf('[', keyIdx);
     var arrEnd = embedsObj.indexOf(']', arrStart);
     var arr = embedsObj.slice(arrStart, arrEnd + 1);
@@ -249,10 +277,8 @@ function _extractStream(embed, cat, ref) {
   var base = (embed.match(/^https?:\/\/[^/]+/) || [])[0] || SITE;
   return _get(embed, ref || SITE + '/').then(function (html) {
     var file = null;
-
     var m1 = html.match(/(https?:\/\/[^"'\s\\]+\.m3u8[^"'\s\\]*)/);
     if (m1) file = m1[1];
-
     if (!file) {
       var m2 = html.match(/file\s*:\s*["']([^"']+\.m3u8[^"']*)["']/i);
       if (m2) file = m2[1];
@@ -269,20 +295,15 @@ function _extractStream(embed, cat, ref) {
         if (m5b) file = m5b[1];
       }
     }
-
     if (!file) throw new Error('AnimeAV1: no stream');
 
     return [{
-      url: file,
-      quality: 'auto',
+      url: file, quality: 'auto',
       container: /\.m3u8(\?|$)/i.test(file) ? 'hls' : 'mp4',
       headers: {
-        'User-Agent': UA,
-        'Referer': base + '/',
-        'Origin': base
+        'User-Agent': UA, 'Referer': base + '/', 'Origin': base
       },
-      kind: cat,
-      audioLang: cat === 'dub' ? 'es' : 'ja',
+      kind: cat, audioLang: cat === 'dub' ? 'es' : 'ja',
       subtitles: []
     }];
   });
